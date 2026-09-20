@@ -76,6 +76,7 @@ function verifySig(keyObj, dataBuf, sigB64) {
 // Used for Member, Hash4, TargetUrl (read-only shared files).
 // Strategy: direct redirect with browser-like headers + cookie handling,
 // with fallback to api.onedrive.com endpoint.
+// Both methods reject HTML responses (web viewer) and only accept file content.
 
 var _odCookies = {}; // domain → { name → value }
 
@@ -99,8 +100,31 @@ function _odSaveCookies(host, hdr) {
     }
 }
 
-function _odSanitize(url) {
-    try { var u = new URL(url); return u.hostname + u.pathname; } catch (e) { return '***'; }
+// Sanitize URL for logging: keep hostname + path, mask sensitive query params
+function _odSanitizeUrl(rawUrl) {
+    try {
+        var u = new URL(rawUrl);
+        var safe = u.hostname + u.pathname;
+        // Show param names but mask values
+        var params = [];
+        u.searchParams.forEach(function (val, key) {
+            params.push(key + '=***');
+        });
+        if (params.length) safe += '?' + params.join('&');
+        return safe;
+    } catch (e) {
+        return '***invalid-url***';
+    }
+}
+
+// Detect if response body is HTML (OneDrive web viewer, not file content)
+function _odIsHtml(body, contentType) {
+    if (contentType && contentType.toLowerCase().indexOf('text/html') !== -1) return true;
+    if (!body || body.length < 10) return false;
+    var head = body.slice(0, 200).toUpperCase();
+    if (head.indexOf('<!DOCTYPE') !== -1) return true;
+    if (head.indexOf('<HTML') !== -1) return true;
+    return false;
 }
 
 function fetchOneDriveText(shareUrl, maxSize, cb) {
@@ -153,14 +177,12 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
                 var cl = res.headers['content-length'] || '?';
                 console.log('[onedrive] ← HTTP ' + res.statusCode + ' ct=' + ct + ' cl=' + cl);
 
-                // Follow 3xx redirects
+                // Follow 3xx redirects — log full sanitized Location
                 if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                     if (++redirects > MAX_REDIRECTS) return finish(new Error('OneDrive qua nhieu redirect'));
                     var next;
                     try { next = new URL(res.headers.location, base || url).toString(); } catch (e) { next = res.headers.location; }
-                    var nh = '';
-                    try { nh = new URL(next).hostname; } catch (e) {}
-                    console.log('[onedrive] redirect → ' + nh);
+                    console.log('[onedrive] redirect ' + res.statusCode + ' → ' + _odSanitizeUrl(next));
                     res.resume(); // drain
                     go(next, next);
                     return;
@@ -178,14 +200,22 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
                     return;
                 }
 
-                // Success — read body
+                // Success HTTP 200 — read body then validate content
                 var body = ''; var size = 0;
                 res.on('data', function (c) {
                     size += c.length;
                     if (size > (maxSize || REMOTE_MAX_BODY)) { req.destroy(new Error('OneDrive response qua lon')); return; }
                     body += c;
                 });
-                res.on('end', function () { console.log('[onedrive] ← OK (' + size + ' bytes)'); finish(null, body); });
+                res.on('end', function () {
+                    // REJECT HTML — this is the web viewer, not file content
+                    if (_odIsHtml(body, ct)) {
+                        console.log('[onedrive] ← HTML web viewer detected (not file content), rejecting');
+                        return finish(new Error('[onedrive] received HTML web viewer instead of file'));
+                    }
+                    console.log('[onedrive] ← OK (' + size + ' bytes, ct=' + ct + ')');
+                    finish(null, body);
+                });
             });
 
             req.on('error', function (e) { finish(e, ''); });
@@ -196,7 +226,8 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
     go(shareUrl, shareUrl);
 }
 
-// Fallback: api.onedrive.com endpoint (simpler, no cookie handling)
+// Fallback: api.onedrive.com endpoint (no browser headers, no cookies)
+// This endpoint returns 302 → CDN URL with actual file content.
 function _odFetchApi(shareUrl, maxSize, cb) {
     var encoded = Buffer.from(shareUrl).toString('base64')
         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -207,53 +238,51 @@ function _odFetchApi(shareUrl, maxSize, cb) {
     var done = false;
     var finish = function (e, b) { if (!done) { done = true; cb(e, b); } };
 
-    try {
-        var req = https.get(apiUrl, {
-            headers: { 'User-Agent': 'jvhd-auth/2.0', 'Accept': '*/*' },
-        }, function (res) {
-            console.log('[onedrive-api] ← HTTP ' + res.statusCode);
+    function doFetch(targetUrl, isRedirect) {
+        try {
+            var req = https.get(targetUrl, {
+                headers: { 'User-Agent': 'jvhd-auth/2.0', 'Accept': '*/*' },
+            }, function (res) {
+                var ct = res.headers['content-type'] || '?';
+                console.log('[onedrive-api] ← HTTP ' + res.statusCode + ' ct=' + ct + (isRedirect ? ' (redirect)' : ''));
 
-            // API may return 302 redirect to actual file
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                var next = res.headers.location;
-                console.log('[onedrive-api] redirect → ' + _odSanitize(next));
-                res.resume();
-                var req2 = https.get(next, {
-                    headers: { 'User-Agent': 'jvhd-auth/2.0', 'Accept': '*/*' },
-                }, function (res2) {
-                    console.log('[onedrive-api] ← HTTP ' + res2.statusCode);
-                    if (res2.statusCode < 200 || res2.statusCode >= 300) {
-                        return finish(new Error('[onedrive-api] → HTTP ' + res2.statusCode));
-                    }
-                    var body = ''; var size = 0;
-                    res2.on('data', function (c) {
-                        size += c.length;
-                        if (size > (maxSize || REMOTE_MAX_BODY)) { req2.destroy(new Error('qua lon')); return; }
-                        body += c;
-                    });
-                    res2.on('end', function () { console.log('[onedrive-api] ← OK (' + size + ' bytes)'); finish(null, body); });
+                // API may return 302 redirect to actual file CDN
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    var next = res.headers.location;
+                    console.log('[onedrive-api] redirect → ' + _odSanitizeUrl(next));
+                    res.resume();
+                    doFetch(next, true);
+                    return;
+                }
+
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                    return finish(new Error('[onedrive-api] → HTTP ' + res.statusCode));
+                }
+
+                // Read body then validate
+                var body = ''; var size = 0;
+                res.on('data', function (c) {
+                    size += c.length;
+                    if (size > (maxSize || REMOTE_MAX_BODY)) { req.destroy(new Error('qua lon')); return; }
+                    body += c;
                 });
-                req2.on('error', function (e) { finish(e, ''); });
-                req2.setTimeout(15000, function () { req2.destroy(new Error('timeout')); });
-                return;
-            }
-
-            if (res.statusCode < 200 || res.statusCode >= 300) {
-                return finish(new Error('[onedrive-api] → HTTP ' + res.statusCode));
-            }
-
-            var body = ''; var size = 0;
-            res.on('data', function (c) {
-                size += c.length;
-                if (size > (maxSize || REMOTE_MAX_BODY)) { req.destroy(new Error('qua lon')); return; }
-                body += c;
+                res.on('end', function () {
+                    // REJECT HTML
+                    if (_odIsHtml(body, ct)) {
+                        console.log('[onedrive-api] ← HTML detected, rejecting');
+                        return finish(new Error('[onedrive-api] received HTML instead of file'));
+                    }
+                    console.log('[onedrive-api] ← OK (' + size + ' bytes, ct=' + ct + ')');
+                    finish(null, body);
+                });
             });
-            res.on('end', function () { console.log('[onedrive-api] ← OK (' + size + ' bytes)'); finish(null, body); });
-        });
 
-        req.on('error', function (e) { finish(e, ''); });
-        req.setTimeout(15000, function () { req.destroy(new Error('timeout')); });
-    } catch (e) { finish(e, ''); }
+            req.on('error', function (e) { finish(e, ''); });
+            req.setTimeout(15000, function () { req.destroy(new Error('timeout')); });
+        } catch (e) { finish(e, ''); }
+    }
+
+    doFetch(apiUrl, false);
 }
 
 // ---- HTTPS fetch utility (Promise-based) ------------------------------------

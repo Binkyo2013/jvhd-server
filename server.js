@@ -124,19 +124,36 @@ function _odIsHtml(body, contentType) {
 }
 
 // Build download URL from OneDrive redirect URL:
-// Change path from /:t:/g/personal/{cid}/{token} → /download
-// Keep ALL original query params (resid, redeem, e, ithint, migratedtospo, etc.)
+// Strategy 1: /download?resid=X&authkey=Y (standard format)
+// Strategy 2: parse HTML web viewer for my.microsoftpersonalcontent.com URL
 function _odBuildDownloadUrl(redirectUrl) {
     try {
         var u = new URL(redirectUrl);
         var resid = u.searchParams.get('resid');
+        var redeem = u.searchParams.get('redeem');
         if (!resid) return null;
-        // Change path to /download, keep all original query params
-        u.protocol = 'https:';
-        u.hostname = 'onedrive.live.com';
-        u.pathname = '/download';
-        return u.toString();
+        // Standard download format: resid + authkey (redeem renamed to authkey)
+        var dl = 'https://onedrive.live.com/download?resid=' + encodeURIComponent(resid);
+        if (redeem) dl += '&authkey=' + encodeURIComponent(redeem);
+        return dl;
     } catch (e) { return null; }
+}
+
+// Extract actual file download URL from OneDrive HTML web viewer page.
+// Modern OneDrive embeds a tempauth URL pointing to my.microsoftpersonalcontent.com
+// or a download.aspx URL with tempauth token.
+function _odExtractDlUrl(html) {
+    if (!html) return null;
+    // Pattern 1: my.microsoftpersonalcontent.com/.../download.aspx?...&tempauth=...
+    var m = html.match(/https?:\/\/[a-z0-9.-]*microsoftpersonalcontent\.com\/[^\s"'<>]+download\.aspx[^\s"'<>]*/i);
+    if (m) return m[0].replace(/&amp;/g, '&');
+    // Pattern 2: any URL with tempauth parameter
+    m = html.match(/https?:\/\/[^\s"'<>]*[?&]tempauth=[^\s"'<>]+/i);
+    if (m) return m[0].replace(/&amp;/g, '&');
+    // Pattern 3: download.aspx URL (any host)
+    m = html.match(/https?:\/\/[^\s"'<>]*download\.aspx[^\s"'<>]*/i);
+    if (m) return m[0].replace(/&amp;/g, '&');
+    return null;
 }
 
 function fetchOneDriveText(shareUrl, maxSize, cb) {
@@ -218,12 +235,20 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
                     body += c;
                 });
                 res.on('end', function () {
-                    // If HTML web viewer → try download URL from redirect params
+                    // If HTML web viewer → try to extract actual download URL
                     if (_odIsHtml(body, ct)) {
-                        console.log('[onedrive] ← HTML web viewer, extracting download URL...');
+                        console.log('[onedrive] ← HTML web viewer (' + size + ' bytes)');
+                        // Strategy 1: extract tempauth URL from HTML (modern OneDrive)
+ var extracted = _odExtractDlUrl(body);
+                        if (extracted) {
+                            console.log('[onedrive] → extracted download URL from HTML');
+                            _odFetchFile(extracted, maxSize, finish);
+                            return;
+                        }
+                        // Strategy 2: standard download URL (resid + authkey)
                         var dlUrl = _odBuildDownloadUrl(firstRedirectUrl);
                         if (dlUrl) {
-                            console.log('[onedrive] → trying download endpoint...');
+                            console.log('[onedrive] → trying standard download URL...');
                             _odFetchFile(dlUrl, maxSize, finish);
                             return;
                         }

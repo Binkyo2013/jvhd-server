@@ -139,21 +139,38 @@ function _odBuildDownloadUrl(redirectUrl) {
     } catch (e) { return null; }
 }
 
-// Extract actual file download URL from OneDrive HTML web viewer page.
-// Modern OneDrive embeds a tempauth URL pointing to my.microsoftpersonalcontent.com
-// or a download.aspx URL with tempauth token.
-function _odExtractDlUrl(html) {
-    if (!html) return null;
-    // Pattern 1: my.microsoftpersonalcontent.com/.../download.aspx?...&tempauth=...
-    var m = html.match(/https?:\/\/[a-z0-9.-]*microsoftpersonalcontent\.com\/[^\s"'<>]+download\.aspx[^\s"'<>]*/i);
-    if (m) return m[0].replace(/&amp;/g, '&');
-    // Pattern 2: any URL with tempauth parameter
-    m = html.match(/https?:\/\/[^\s"'<>]*[?&]tempauth=[^\s"'<>]+/i);
-    if (m) return m[0].replace(/&amp;/g, '&');
-    // Pattern 3: download.aspx URL (any host)
-    m = html.match(/https?:\/\/[^\s"'<>]*download\.aspx[^\s"'<>]*/i);
-    if (m) return m[0].replace(/&amp;/g, '&');
-    return null;
+// Extract CID and resid from first redirect URL for SPO download
+function _odExtractIds(redirectUrl) {
+    try {
+        var u = new URL(redirectUrl);
+        var cid = u.searchParams.get('cid');
+        var resid = u.searchParams.get('resid');
+        if (!cid) {
+            // Extract from path: /:t:/g/personal/{cid}/{token}
+            var m = u.pathname.match(/\/personal\/([A-F0-9]+)\//i);
+            if (m) cid = m[1];
+        }
+        return { cid: cid, resid: resid };
+    } catch (e) { return { cid: null, resid: null }; }
+}
+
+// Build SPO download URL: /personal/{cid}/_layouts/15/download.aspx?UniqueId={fileid}
+function _odBuildSpoDownloadUrl(redirectUrl) {
+    var ids = _odExtractIds(redirectUrl);
+    if (!ids.cid || !ids.resid) return null;
+    // resid format: CID!fileid  → extract fileid part
+    var bang = ids.resid.indexOf('!');
+    var fileId = bang >= 0 ? ids.resid.slice(bang + 1) : ids.resid;
+    return 'https://onedrive.live.com/personal/' + ids.cid + '/_layouts/15/download.aspx?UniqueId=' + encodeURIComponent(fileId) + '&Translate=false';
+}
+
+// Build SPO API URL: /personal/{cid}/_api/v2.0/shares/u!{encoded}/root/content
+function _odBuildSpoApiUrl(shareUrl, redirectUrl) {
+    var ids = _odExtractIds(redirectUrl);
+    if (!ids.cid) return null;
+    var encoded = Buffer.from(shareUrl).toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    return 'https://onedrive.live.com/personal/' + ids.cid + '/_api/v2.0/shares/u!' + encoded + '/root/content';
 }
 
 function fetchOneDriveText(shareUrl, maxSize, cb) {
@@ -255,14 +272,41 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
                         }
 
                         console.log('[onedrive] ← HTML web viewer (' + size + ' bytes)');
-                        // Strategy 1: extract tempauth URL from HTML (modern OneDrive)
-                        var extracted = _odExtractDlUrl(body);
-                        if (extracted) {
-                            console.log('[onedrive] → extracted download URL from HTML');
-                            _odFetchFile(extracted, maxSize, finish);
+                        // Strategy 1: SPO download endpoint (same domain, with cookies)
+                        var spoDl = _odBuildSpoDownloadUrl(firstRedirectUrl);
+                        if (spoDl) {
+                            console.log('[onedrive] → trying SPO download endpoint...');
+                            _odFetchFile(spoDl, maxSize, function (err1, body1) {
+                                if (!err1) return finish(null, body1);
+                                // Strategy 2: SPO API (same domain, with cookies)
+                                var spoApi = _odBuildSpoApiUrl(shareUrl, firstRedirectUrl);
+                                if (spoApi) {
+                                    console.log('[onedrive] → trying SPO API endpoint...');
+                                    _odFetchFile(spoApi, maxSize, function (err2, body2) {
+                                        if (!err2) return finish(null, body2);
+                                        // Strategy 3: standard download URL (resid + authkey)
+ var dlUrl = _odBuildDownloadUrl(firstRedirectUrl);
+                                        if (dlUrl) {
+                                            console.log('[onedrive] → trying standard download URL...');
+                                            _odFetchFile(dlUrl, maxSize, finish);
+                                            return;
+                                        }
+                                        finish(new Error('[onedrive] all download methods failed'));
+                                    });
+                                    return;
+                                }
+                                // No SPO API, try standard download
+                                var dlUrl = _odBuildDownloadUrl(firstRedirectUrl);
+                                if (dlUrl) {
+                                    console.log('[onedrive] → trying standard download URL...');
+                                    _odFetchFile(dlUrl, maxSize, finish);
+                                    return;
+                                }
+                                finish(new Error('[onedrive] all download methods failed'));
+                            });
                             return;
                         }
-                        // Strategy 2: standard download URL (resid + authkey)
+                        // No SPO URL, try standard download
                         var dlUrl = _odBuildDownloadUrl(firstRedirectUrl);
                         if (dlUrl) {
                             console.log('[onedrive] → trying standard download URL...');

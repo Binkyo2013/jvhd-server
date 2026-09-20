@@ -237,9 +237,26 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
                 res.on('end', function () {
                     // If HTML web viewer → try to extract actual download URL
                     if (_odIsHtml(body, ct)) {
+                        // Diagnostic: log HTML snippet for debugging download patterns
+                        var _snippet = body.replace(/[\x00-\x1f]/g, ' ').slice(0, 1500);
+                        console.log('[onedrive-diag] HTML snippet: ' + _snippet.slice(0, 800));
+                        // Search for download URLs in the full HTML
+                        var _dlMatch = body.match(/https?:\/\/[^\s"'<>]*download[^\s"'<>]*/gi);
+                        if (_dlMatch) console.log('[onedrive-diag] download URLs found: ' + _dlMatch.length);
+                        for (var _di = 0; _di < Math.min((_dlMatch || []).length, 5); _di++) {
+                            console.log('[onedrive-diag]   dl[' + _di + ']=' + _dlMatch[_di].slice(0, 200));
+                        }
+                        var _taMatch = body.match(/https?:\/\/[^\s"'<>]*tempauth[^\s"'<>]*/gi);
+                        if (_taMatch) {
+                            console.log('[onedrive-diag] tempauth URLs: ' + _taMatch.length);
+                            for (var _ti = 0; _ti < Math.min(_taMatch.length, 3); _ti++) {
+                                console.log('[onedrive-diag]   ta[' + _ti + ']=' + _taMatch[_ti].slice(0, 200));
+                            }
+                        }
+
                         console.log('[onedrive] ← HTML web viewer (' + size + ' bytes)');
                         // Strategy 1: extract tempauth URL from HTML (modern OneDrive)
- var extracted = _odExtractDlUrl(body);
+                        var extracted = _odExtractDlUrl(body);
                         if (extracted) {
                             console.log('[onedrive] → extracted download URL from HTML');
                             _odFetchFile(extracted, maxSize, finish);

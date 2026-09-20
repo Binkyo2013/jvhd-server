@@ -74,9 +74,12 @@ function verifySig(keyObj, dataBuf, sigB64) {
 
 // ---- OneDrive reader --------------------------------------------------------
 // Used for Member, Hash4, TargetUrl (read-only shared files).
-// Strategy: direct redirect with browser-like headers + cookie handling,
-// with fallback to api.onedrive.com endpoint.
-// Both methods reject HTML responses (web viewer) and only accept file content.
+// Strategy:
+//   1. Follow 1drv.ms redirect → extract resid/redeem from redirect URL
+//   2. Construct download URL (onedrive.live.com/download?resid=...&authkey=...)
+//   3. Fetch actual file content (not HTML web viewer)
+//   4. Fallback to api.onedrive.com endpoint
+// Both methods reject HTML responses and only accept file content.
 
 var _odCookies = {}; // domain → { name → value }
 
@@ -100,35 +103,41 @@ function _odSaveCookies(host, hdr) {
     }
 }
 
-// Sanitize URL for logging: keep hostname + path, mask sensitive query params
+// Sanitize URL for logging: keep hostname + path, mask query param values
 function _odSanitizeUrl(rawUrl) {
     try {
         var u = new URL(rawUrl);
         var safe = u.hostname + u.pathname;
-        // Show param names but mask values
         var params = [];
-        u.searchParams.forEach(function (val, key) {
-            params.push(key + '=***');
-        });
+        u.searchParams.forEach(function (val, key) { params.push(key + '=***'); });
         if (params.length) safe += '?' + params.join('&');
         return safe;
-    } catch (e) {
-        return '***invalid-url***';
-    }
+    } catch (e) { return '***'; }
 }
 
-// Detect if response body is HTML (OneDrive web viewer, not file content)
+// Detect if response is HTML (OneDrive web viewer, not file content)
 function _odIsHtml(body, contentType) {
     if (contentType && contentType.toLowerCase().indexOf('text/html') !== -1) return true;
     if (!body || body.length < 10) return false;
     var head = body.slice(0, 200).toUpperCase();
-    if (head.indexOf('<!DOCTYPE') !== -1) return true;
-    if (head.indexOf('<HTML') !== -1) return true;
-    return false;
+    return head.indexOf('<!DOCTYPE') !== -1 || head.indexOf('<HTML') !== -1;
+}
+
+// Build download URL from OneDrive redirect URL by extracting resid + redeem
+function _odBuildDownloadUrl(redirectUrl) {
+    try {
+        var u = new URL(redirectUrl);
+        var resid = u.searchParams.get('resid');
+        var redeem = u.searchParams.get('redeem');
+        if (!resid) return null;
+        var dl = 'https://onedrive.live.com/download?resid=' + encodeURIComponent(resid);
+        if (redeem) dl += '&authkey=' + encodeURIComponent(redeem);
+        return dl;
+    } catch (e) { return null; }
 }
 
 function fetchOneDriveText(shareUrl, maxSize, cb) {
-    // Primary: direct redirect with browser-like headers
+    // Primary: follow redirects → extract download URL → fetch file
     _odFetchDirect(shareUrl, maxSize, function (err, body) {
         if (!err) return cb(null, body);
         // Fallback: api.onedrive.com endpoint
@@ -139,10 +148,11 @@ function fetchOneDriveText(shareUrl, maxSize, cb) {
     });
 }
 
-// Direct redirect with browser-like headers + cookies
+// Primary: follow 1drv.ms redirects, extract resid/redeem, download file
 function _odFetchDirect(shareUrl, maxSize, cb) {
     var redirects = 0;
     var MAX_REDIRECTS = 10;
+    var firstRedirectUrl = null; // save first redirect (has resid/redeem)
 
     function go(url, base) {
         var done = false;
@@ -154,17 +164,14 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
 
             var headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'identity',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
                 'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
                 'Upgrade-Insecure-Requests': '1',
-                'Cache-Control': 'max-age=0',
             };
-
             var ck = _odCookieStr(host);
             if (ck) headers['Cookie'] = ck;
 
@@ -172,35 +179,35 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
 
             var req = https.get(url, { headers: headers }, function (res) {
                 _odSaveCookies(host, res.headers['set-cookie']);
-
                 var ct = res.headers['content-type'] || '?';
                 var cl = res.headers['content-length'] || '?';
                 console.log('[onedrive] ← HTTP ' + res.statusCode + ' ct=' + ct + ' cl=' + cl);
 
-                // Follow 3xx redirects — log full sanitized Location
+                // Follow 3xx redirects
                 if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                     if (++redirects > MAX_REDIRECTS) return finish(new Error('OneDrive qua nhieu redirect'));
                     var next;
                     try { next = new URL(res.headers.location, base || url).toString(); } catch (e) { next = res.headers.location; }
+                    // Save first redirect (contains resid/redeem for download URL)
+                    if (!firstRedirectUrl) firstRedirectUrl = next;
                     console.log('[onedrive] redirect ' + res.statusCode + ' → ' + _odSanitizeUrl(next));
-                    res.resume(); // drain
+                    res.resume();
                     go(next, next);
                     return;
                 }
 
-                // Error response — read body for diagnostic
+                // Error response
                 if (res.statusCode < 200 || res.statusCode >= 300) {
                     var eb = ''; var es = 0;
                     res.on('data', function (c) { es += c.length; if (es < 500) eb += c.toString(); });
                     res.on('end', function () {
-                        var safe = eb.replace(/[\w+\/=-]{20,}/g, '***').replace(/cookie\S*/gi, 'cookie=***');
-                        console.log('[onedrive] error body: ' + safe.slice(0, 300));
+                        console.log('[onedrive] error body: ' + eb.replace(/[\w+\/=-]{20,}/g, '***').slice(0, 300));
                         finish(new Error('[onedrive] GET ' + host + ' → HTTP ' + res.statusCode));
                     });
                     return;
                 }
 
-                // Success HTTP 200 — read body then validate content
+                // HTTP 200 — read body
                 var body = ''; var size = 0;
                 res.on('data', function (c) {
                     size += c.length;
@@ -208,11 +215,18 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
                     body += c;
                 });
                 res.on('end', function () {
-                    // REJECT HTML — this is the web viewer, not file content
+                    // If HTML web viewer → try download URL from redirect params
                     if (_odIsHtml(body, ct)) {
-                        console.log('[onedrive] ← HTML web viewer detected (not file content), rejecting');
-                        return finish(new Error('[onedrive] received HTML web viewer instead of file'));
+                        console.log('[onedrive] ← HTML web viewer, extracting download URL...');
+                        var dlUrl = _odBuildDownloadUrl(firstRedirectUrl);
+                        if (dlUrl) {
+                            console.log('[onedrive] → trying download endpoint...');
+                            _odFetchFile(dlUrl, maxSize, finish);
+                            return;
+                        }
+                        return finish(new Error('[onedrive] no resid in redirect, cannot download'));
                     }
+                    // Not HTML — this is actual file content
                     console.log('[onedrive] ← OK (' + size + ' bytes, ct=' + ct + ')');
                     finish(null, body);
                 });
@@ -226,8 +240,62 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
     go(shareUrl, shareUrl);
 }
 
+// Fetch file from download URL (follows redirects, rejects HTML)
+function _odFetchFile(url, maxSize, cb) {
+    var redirects = 0;
+    var MAX_REDIRECTS = 10;
+
+    function go(targetUrl) {
+        var done = false;
+        var finish = function (e, b) { if (!done) { done = true; cb(e, b); } };
+
+        try {
+            var req = https.get(targetUrl, {
+                headers: { 'User-Agent': 'jvhd-auth/2.0', 'Accept': '*/*' },
+            }, function (res) {
+                var ct = res.headers['content-type'] || '?';
+                console.log('[onedrive-dl] ← HTTP ' + res.statusCode + ' ct=' + ct);
+
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    if (++redirects > MAX_REDIRECTS) return finish(new Error('qua nhieu redirect'));
+                    var next;
+                    try { next = new URL(res.headers.location, targetUrl).toString(); } catch (e) { next = res.headers.location; }
+                    console.log('[onedrive-dl] redirect → ' + _odSanitizeUrl(next));
+                    res.resume();
+                    go(next);
+                    return;
+                }
+
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                    return finish(new Error('[onedrive-dl] → HTTP ' + res.statusCode));
+                }
+
+                var body = ''; var size = 0;
+                res.on('data', function (c) {
+                    size += c.length;
+                    if (size > maxSize) { req.destroy(new Error('qua lon')); return; }
+                    body += c;
+                });
+                res.on('end', function () {
+                    if (_odIsHtml(body, ct)) {
+                        console.log('[onedrive-dl] ← HTML detected, rejecting');
+                        return finish(new Error('[onedrive-dl] received HTML instead of file'));
+                    }
+                    console.log('[onedrive-dl] ← OK (' + size + ' bytes, ct=' + ct + ')');
+                    finish(null, body);
+                });
+            });
+
+            req.on('error', function (e) { finish(e, ''); });
+            req.setTimeout(15000, function () { req.destroy(new Error('timeout')); });
+        } catch (e) { finish(e, ''); }
+    }
+
+    go(url);
+}
+
 // Fallback: api.onedrive.com endpoint (no browser headers, no cookies)
-// This endpoint returns 302 → CDN URL with actual file content.
+// Returns 302 → CDN URL with actual file content (or 401 if not authorized).
 function _odFetchApi(shareUrl, maxSize, cb) {
     var encoded = Buffer.from(shareUrl).toString('base64')
         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -246,7 +314,6 @@ function _odFetchApi(shareUrl, maxSize, cb) {
                 var ct = res.headers['content-type'] || '?';
                 console.log('[onedrive-api] ← HTTP ' + res.statusCode + ' ct=' + ct + (isRedirect ? ' (redirect)' : ''));
 
-                // API may return 302 redirect to actual file CDN
                 if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                     var next = res.headers.location;
                     console.log('[onedrive-api] redirect → ' + _odSanitizeUrl(next));
@@ -259,7 +326,6 @@ function _odFetchApi(shareUrl, maxSize, cb) {
                     return finish(new Error('[onedrive-api] → HTTP ' + res.statusCode));
                 }
 
-                // Read body then validate
                 var body = ''; var size = 0;
                 res.on('data', function (c) {
                     size += c.length;
@@ -267,7 +333,6 @@ function _odFetchApi(shareUrl, maxSize, cb) {
                     body += c;
                 });
                 res.on('end', function () {
-                    // REJECT HTML
                     if (_odIsHtml(body, ct)) {
                         console.log('[onedrive-api] ← HTML detected, rejecting');
                         return finish(new Error('[onedrive-api] received HTML instead of file'));

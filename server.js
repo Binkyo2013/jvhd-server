@@ -123,16 +123,19 @@ function _odIsHtml(body, contentType) {
     return head.indexOf('<!DOCTYPE') !== -1 || head.indexOf('<HTML') !== -1;
 }
 
-// Build download URL from OneDrive redirect URL by extracting resid + redeem
+// Build download URL from OneDrive redirect URL:
+// Change path from /:t:/g/personal/{cid}/{token} → /download
+// Keep ALL original query params (resid, redeem, e, ithint, migratedtospo, etc.)
 function _odBuildDownloadUrl(redirectUrl) {
     try {
         var u = new URL(redirectUrl);
         var resid = u.searchParams.get('resid');
-        var redeem = u.searchParams.get('redeem');
         if (!resid) return null;
-        var dl = 'https://onedrive.live.com/download?resid=' + encodeURIComponent(resid);
-        if (redeem) dl += '&authkey=' + encodeURIComponent(redeem);
-        return dl;
+        // Change path to /download, keep all original query params
+        u.protocol = 'https:';
+        u.hostname = 'onedrive.live.com';
+        u.pathname = '/download';
+        return u.toString();
     } catch (e) { return null; }
 }
 
@@ -241,6 +244,7 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
 }
 
 // Fetch file from download URL (follows redirects, rejects HTML)
+// Uses browser-like headers + cookies to avoid 403 from OneDrive
 function _odFetchFile(url, maxSize, cb) {
     var redirects = 0;
     var MAX_REDIRECTS = 10;
@@ -250,9 +254,25 @@ function _odFetchFile(url, maxSize, cb) {
         var finish = function (e, b) { if (!done) { done = true; cb(e, b); } };
 
         try {
-            var req = https.get(targetUrl, {
-                headers: { 'User-Agent': 'jvhd-auth/2.0', 'Accept': '*/*' },
-            }, function (res) {
+            var u = new URL(targetUrl);
+            var host = u.hostname;
+
+            var headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'identity',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+            };
+            var ck = _odCookieStr(host);
+            if (ck) headers['Cookie'] = ck;
+
+            console.log('[onedrive-dl] GET ' + host + '...');
+
+            var req = https.get(targetUrl, { headers: headers }, function (res) {
+                _odSaveCookies(host, res.headers['set-cookie']);
                 var ct = res.headers['content-type'] || '?';
                 console.log('[onedrive-dl] ← HTTP ' + res.statusCode + ' ct=' + ct);
 

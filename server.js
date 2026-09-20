@@ -139,32 +139,21 @@ function _odBuildDownloadUrl(redirectUrl) {
     } catch (e) { return null; }
 }
 
-// Extract CID and resid from first redirect URL for SPO download
+// Extract CID from redirect URL for SPO API
 function _odExtractIds(redirectUrl) {
     try {
         var u = new URL(redirectUrl);
         var cid = u.searchParams.get('cid');
-        var resid = u.searchParams.get('resid');
         if (!cid) {
-            // Extract from path: /:t:/g/personal/{cid}/{token}
             var m = u.pathname.match(/\/personal\/([A-F0-9]+)\//i);
             if (m) cid = m[1];
         }
-        return { cid: cid, resid: resid };
-    } catch (e) { return { cid: null, resid: null }; }
-}
-
-// Build SPO download URL: /personal/{cid}/_layouts/15/download.aspx?UniqueId={fileid}
-function _odBuildSpoDownloadUrl(redirectUrl) {
-    var ids = _odExtractIds(redirectUrl);
-    if (!ids.cid || !ids.resid) return null;
-    // resid format: CID!fileid  → extract fileid part
-    var bang = ids.resid.indexOf('!');
-    var fileId = bang >= 0 ? ids.resid.slice(bang + 1) : ids.resid;
-    return 'https://onedrive.live.com/personal/' + ids.cid + '/_layouts/15/download.aspx?UniqueId=' + encodeURIComponent(fileId) + '&Translate=false';
+        return { cid: cid };
+    } catch (e) { return { cid: null }; }
 }
 
 // Build SPO API URL: /personal/{cid}/_api/v2.0/shares/u!{encoded}/root/content
+// Returns 302 → CDN URL with tempauth → actual file content.
 function _odBuildSpoApiUrl(shareUrl, redirectUrl) {
     var ids = _odExtractIds(redirectUrl);
     if (!ids.cid) return null;
@@ -252,51 +241,17 @@ function _odFetchDirect(shareUrl, maxSize, cb) {
                     body += c;
                 });
                 res.on('end', function () {
-                    // If HTML web viewer → try to extract actual download URL
+                    // If HTML web viewer → try SPO API to get actual file
                     if (_odIsHtml(body, ct)) {
-                        // Diagnostic: log HTML snippet for debugging download patterns
-                        var _snippet = body.replace(/[\x00-\x1f]/g, ' ').slice(0, 1500);
-                        console.log('[onedrive-diag] HTML snippet: ' + _snippet.slice(0, 800));
-                        // Search for download URLs in the full HTML
-                        var _dlMatch = body.match(/https?:\/\/[^\s"'<>]*download[^\s"'<>]*/gi);
-                        if (_dlMatch) console.log('[onedrive-diag] download URLs found: ' + _dlMatch.length);
-                        for (var _di = 0; _di < Math.min((_dlMatch || []).length, 5); _di++) {
-                            console.log('[onedrive-diag]   dl[' + _di + ']=' + _dlMatch[_di].slice(0, 200));
-                        }
-                        var _taMatch = body.match(/https?:\/\/[^\s"'<>]*tempauth[^\s"'<>]*/gi);
-                        if (_taMatch) {
-                            console.log('[onedrive-diag] tempauth URLs: ' + _taMatch.length);
-                            for (var _ti = 0; _ti < Math.min(_taMatch.length, 3); _ti++) {
-                                console.log('[onedrive-diag]   ta[' + _ti + ']=' + _taMatch[_ti].slice(0, 200));
-                            }
-                        }
-
                         console.log('[onedrive] ← HTML web viewer (' + size + ' bytes)');
-                        // Strategy 1: SPO download endpoint (same domain, with cookies)
-                        var spoDl = _odBuildSpoDownloadUrl(firstRedirectUrl);
-                        if (spoDl) {
-                            console.log('[onedrive] → trying SPO download endpoint...');
-                            _odFetchFile(spoDl, maxSize, function (err1, body1) {
+                        // Strategy 1: SPO API (same domain, with cookies from redirect chain)
+                        var spoApi = _odBuildSpoApiUrl(shareUrl, firstRedirectUrl);
+                        if (spoApi) {
+                            console.log('[onedrive] → trying SPO API endpoint...');
+                            _odFetchFile(spoApi, maxSize, function (err1, body1) {
                                 if (!err1) return finish(null, body1);
-                                // Strategy 2: SPO API (same domain, with cookies)
-                                var spoApi = _odBuildSpoApiUrl(shareUrl, firstRedirectUrl);
-                                if (spoApi) {
-                                    console.log('[onedrive] → trying SPO API endpoint...');
-                                    _odFetchFile(spoApi, maxSize, function (err2, body2) {
-                                        if (!err2) return finish(null, body2);
-                                        // Strategy 3: standard download URL (resid + authkey)
+                                // Strategy 2: standard download URL (resid + authkey)
  var dlUrl = _odBuildDownloadUrl(firstRedirectUrl);
-                                        if (dlUrl) {
-                                            console.log('[onedrive] → trying standard download URL...');
-                                            _odFetchFile(dlUrl, maxSize, finish);
-                                            return;
-                                        }
-                                        finish(new Error('[onedrive] all download methods failed'));
-                                    });
-                                    return;
-                                }
-                                // No SPO API, try standard download
-                                var dlUrl = _odBuildDownloadUrl(firstRedirectUrl);
                                 if (dlUrl) {
                                     console.log('[onedrive] → trying standard download URL...');
                                     _odFetchFile(dlUrl, maxSize, finish);

@@ -1038,6 +1038,11 @@ var server = http.createServer(function (req, res) {
             bindingLoadedAt: bindingState.loadedAt,
             bindingSavedAt: bindingState.savedAt,
             bindingError: bindingState.error,
+            onedrive: {
+                member:    { ok: memberCache.ok,    count: memberCache.data    ? memberCache.data.length : 0, error: memberCache.error },
+                hash4:     { ok: hash4Cache.ok,     count: hash4Cache.list.size, error: hash4Cache.error },
+                targeturl: { ok: targeturlCache.ok, error: targeturlCache.error },
+            },
         });
     }
     if (req.method === 'GET' && url.pathname === '/admin/list') {

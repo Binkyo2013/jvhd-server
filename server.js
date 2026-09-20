@@ -1,32 +1,34 @@
 'use strict';
 // ============================================================================
 // JVHD AUTH SERVER — Device Binding + Challenge/Response (Yc11)
+// Data source: OneDrive READ ONLY (replaces JSONBin)
 // ============================================================================
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 
-const ALLOWLIST_JSON_URL = process.env.ALLOWLIST_JSON_URL ||
-    'https://api.jsonbin.io/v3/b/6a9245b5f5f4af5e29504b20/latest';
+// ---- OneDrive share URLs (READ ONLY) ----------------------------------------
+// These can be overridden via environment variables on Render.
+const ONEDRIVE_MEMBER_URL = process.env.ONEDRIVE_MEMBER_URL ||
+    'https://1drv.ms/t/c/3d6a4ca52f4e4e18/IQBDC0QATqfRR4ROzrev8HbZAYl9Ie1vzNapxj7CTMPX08g?e=coaE1V';
+const ONEDRIVE_HASH4_URL = process.env.ONEDRIVE_HASH4_URL ||
+    'https://1drv.ms/t/c/3d6a4ca52f4e4e18/IQDDyKOWH_aLS40GJvPdPhK9AWjPGlotl_cqrjuD8fBGHtY?e=Sbe5u2';
+const ONEDRIVE_BINDING_URL = process.env.ONEDRIVE_BINDING_URL ||
+    'https://1drv.ms/t/c/3d6a4ca52f4e4e18/IQBWqH6cfl_RSKUFv8u1A-8SAWurCQjKeOvM9hNGUXtxn_E?e=lpaSYb';
+const ONEDRIVE_TARGETURL_URL = process.env.ONEDRIVE_TARGETURL_URL ||
+    'https://1drv.ms/t/c/3d6a4ca52f4e4e18/IQBzWVFIXQRfRY5w1af6pNjxAYwIHtGQEk_OX2EV-_i_XRw?e=K8wJkD';
+
+const ONEDRIVE_TTL_MS = parseInt(process.env.ONEDRIVE_TTL_MS || '60000', 10);
 const ALLOWLIST_STATIC = process.env.ALLOWLIST_STATIC || '';
-const ALLOWLIST_TTL_MS = parseInt(process.env.ALLOWLIST_TTL_MS || '60000', 10);
-
-// JSONBin rieng dung de luu binding. KHONG ghi key truc tiep vao source code.
-const BINDING_BIN_URL = process.env.BINDING_BIN_URL || '';
-const BINDING_BIN_KEY = process.env.BINDING_BIN_KEY || '';
-const BINDING_BIN_KEY_HEADER = process.env.BINDING_BIN_KEY_HEADER || 'X-Master-Key';
-const BINDING_LOAD_ATTEMPTS = parseInt(process.env.BINDING_LOAD_ATTEMPTS || '5', 10);
 
 const CHALLENGE_TTL_MS = parseInt(process.env.CHALLENGE_TTL_MS || '120000', 10);
 const MAX_BODY = parseInt(process.env.MAX_BODY || '16384', 10);
 const REMOTE_MAX_BODY = parseInt(process.env.REMOTE_MAX_BODY || String(MAX_BODY * 100), 10);
+const BINDING_LOAD_ATTEMPTS = parseInt(process.env.BINDING_LOAD_ATTEMPTS || '5', 10);
 
 const CRYPTO_HASH_RE = /^[0-9a-f]{64}$/;
 const SPKI_P256 = Buffer.from(
@@ -59,13 +61,87 @@ function verifySig(keyObj, dataBuf, sigB64) {
     }
 }
 
+// ---- OneDrive fetcher -------------------------------------------------------
+
+// Convert 1drv.ms share URL to OneDrive API download URL.
+// The API endpoint returns a 302 redirect to the actual file content.
+function oneDriveDownloadUrl(shareUrl) {
+    const encoded = Buffer.from(shareUrl)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    return 'https://api.onedrive.com/v1.0/shares/u!' + encoded + '/root/content';
+}
+
+// Fetch text content from a OneDrive share URL, following redirects.
+function fetchOneDriveText(shareUrl, maxSize, cb) {
+    const apiUrl = oneDriveDownloadUrl(shareUrl);
+    let redirects = 0;
+    const MAX_REDIRECTS = 10;
+
+    function doRequest(url) {
+        let done = false;
+        const finish = (err, body) => {
+            if (done) return;
+            done = true;
+            cb(err, body);
+        };
+
+        try {
+            const req = https.get(url, {
+                headers: { 'User-Agent': 'jvhd-auth/2.0' },
+            }, res => {
+                // Follow redirects (301, 302, 303, 307, 308)
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    redirects++;
+                    if (redirects > MAX_REDIRECTS) {
+                        return finish(new Error('OneDrive qua nhieu redirect'));
+                    }
+                    doRequest(res.headers.location);
+                    return;
+                }
+
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                    return finish(new Error('OneDrive HTTP ' + res.statusCode));
+                }
+
+                let body = '';
+                let size = 0;
+                res.on('data', chunk => {
+                    size += chunk.length;
+                    if (size > (maxSize || REMOTE_MAX_BODY)) {
+                        req.destroy(new Error('OneDrive response qua lon'));
+                        return;
+                    }
+                    body += chunk;
+                });
+                res.on('end', () => finish(null, body));
+            });
+
+            req.on('error', e => finish(e, ''));
+            req.setTimeout(15000, () => req.destroy(new Error('OneDrive timeout')));
+        } catch (e) {
+            finish(e, '');
+        }
+    }
+
+    doRequest(apiUrl);
+}
+
+// ---- Data cache (OneDrive) --------------------------------------------------
+// Cache structure: { data, loadedAt (ms timestamp), ok, error }
+let memberCache = { data: null, loadedAt: 0, ok: false, error: null };
+let hash4Cache = { list: new Set(), loadedAt: 0, ok: false, error: null };
+let targeturlCache = { data: null, loadedAt: 0, ok: false, error: null };
+
 // ---- binding store ----------------------------------------------------------
 let bindings = {}; // { [hash64]: { k: '<b64 65B>', at: <ms> } }
 let bindingState = {
     ready: false,
     source: null,
     loadedAt: null,
-    savedAt: null,
+    savedAt: null, // kept for API compat; always null (OneDrive is READ ONLY)
     error: null,
 };
 
@@ -74,7 +150,7 @@ function cloneBindings(value) {
 }
 
 function normalizeBindings(value) {
-    // Ho tro ca object noi bo va mang do /admin/list tra ve.
+    // Support both internal object and array format from /admin/list.
     const source = Array.isArray(value)
         ? value
         : (value && Array.isArray(value.bindings) ? value.bindings : null);
@@ -114,154 +190,149 @@ function normalizeBindings(value) {
     return result;
 }
 
-function loadLocalData() {
-    try {
-        const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-        bindings = normalizeBindings(data);
-        bindingState = {
-            ready: true,
-            source: 'local',
-            loadedAt: new Date().toISOString(),
-            savedAt: null,
-            error: null,
-        };
-        return true;
-    } catch (e) {
-        return false;
-    }
-}
-
-function saveLocalData() {
-    const tmp = DATA_FILE + '.tmp';
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify({ bindings }, null, 2));
-    fs.renameSync(tmp, DATA_FILE);
-}
-
-function jsonBinRequest(method, body) {
-    return new Promise((resolve, reject) => {
-        if (!BINDING_BIN_URL) return reject(new Error('Thieu BINDING_BIN_URL'));
-        if (!BINDING_BIN_KEY) return reject(new Error('Thieu BINDING_BIN_KEY'));
-        if (!/^X-(Master|Access)-Key$/i.test(BINDING_BIN_KEY_HEADER)) {
-            return reject(new Error('BINDING_BIN_KEY_HEADER khong hop le'));
-        }
-
-        let target;
-        try {
-            target = new URL(BINDING_BIN_URL);
-        } catch (e) {
-            return reject(new Error('BINDING_BIN_URL khong hop le'));
-        }
-        if (target.protocol !== 'https:') {
-            return reject(new Error('BINDING_BIN_URL phai dung HTTPS'));
-        }
-
-        // JSONBin PUT dung /v3/b/<id>, khong dung hau to /latest.
-        if (method === 'PUT') target.pathname = target.pathname.replace(/\/latest\/?$/, '');
-        if (method === 'GET') target.searchParams.set('ts', String(Date.now()));
-
-        const payload = body === undefined ? null : JSON.stringify(body);
-        const headers = {
-            'User-Agent': 'jvhd-auth/2.0',
-            [BINDING_BIN_KEY_HEADER]: BINDING_BIN_KEY,
-            'Cache-Control': 'no-cache',
-        };
-        if (payload !== null) {
-            headers['Content-Type'] = 'application/json';
-            headers['Content-Length'] = Buffer.byteLength(payload);
-        }
-
-        let settled = false;
-        const finish = (err, value) => {
-            if (settled) return;
-            settled = true;
-            if (err) reject(err); else resolve(value);
-        };
-
-        const req = https.request(target, { method, headers }, res => {
-            let text = '';
-            let size = 0;
-            res.on('data', chunk => {
-                size += chunk.length;
-                if (size > REMOTE_MAX_BODY) {
-                    req.destroy(new Error('JSONBin response qua lon'));
-                    return;
-                }
-                text += chunk;
-            });
-            res.on('end', () => {
-                if (res.statusCode < 200 || res.statusCode >= 300) {
-                    return finish(new Error(
-                        'JSONBin HTTP ' + res.statusCode + ': ' + text.slice(0, 300)
-                    ));
-                }
-                try {
-                    finish(null, text ? JSON.parse(text) : {});
-                } catch (e) {
-                    finish(new Error('JSONBin tra ve JSON khong hop le'));
-                }
-            });
-        });
-        req.on('error', finish);
-        req.setTimeout(15000, () => req.destroy(new Error('JSONBin timeout')));
-        if (payload !== null) req.write(payload);
-        req.end();
-    });
-}
-
-async function loadBindingsFromJsonBin() {
-    const payload = await jsonBinRequest('GET');
-    if (!Object.prototype.hasOwnProperty.call(payload, 'record')) {
-        throw new Error('JSONBin response khong co truong record');
-    }
-    return normalizeBindings(payload.record);
-}
-
-async function saveBindingsToJsonBin() {
-    // JSONBin se boc body nay trong truong "record" khi doc lai.
-    await jsonBinRequest('PUT', { bindings });
-    bindingState.savedAt = new Date().toISOString();
-}
-
+// ---- Sleep utility ----------------------------------------------------------
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function loadBindingsAtStartup() {
-    let lastError;
+// ---- Load all data from OneDrive at startup ---------------------------------
+async function loadAllAtStartup() {
+    // 1. Load Binding.txt (CRITICAL — server won't start without it)
+    let bindingLoaded = false;
+    let lastBindingError;
     for (let attempt = 1; attempt <= BINDING_LOAD_ATTEMPTS; attempt++) {
         try {
-            console.log('[binding] tai JSONBin lan ' + attempt + '/' + BINDING_LOAD_ATTEMPTS);
-            const loaded = await loadBindingsFromJsonBin();
-            bindings = loaded;
+            console.log('[binding] tai OneDrive Binding.txt lan ' + attempt + '/' + BINDING_LOAD_ATTEMPTS);
+            const text = await new Promise((resolve, reject) => {
+                fetchOneDriveText(ONEDRIVE_BINDING_URL, REMOTE_MAX_BODY, (err, body) => {
+                    if (err) reject(err); else resolve(body);
+                });
+            });
+            const data = JSON.parse(text);
+            bindings = normalizeBindings(data);
             bindingState = {
                 ready: true,
-                source: 'jsonbin',
+                source: 'onedrive',
                 loadedAt: new Date().toISOString(),
                 savedAt: null,
                 error: null,
             };
-            try {
-                saveLocalData();
-            } catch (e) {
-                console.error('[binding] khong ghi duoc local backup:', e.message);
-            }
-            console.log('[binding] da nap ' + Object.keys(bindings).length + ' binding');
-            return;
+            bindingLoaded = true;
+            console.log('[binding] Binding.txt → OK — da nap ' + Object.keys(bindings).length + ' binding');
+            break;
         } catch (e) {
-            lastError = e;
-            console.error('[binding] tai that bai:', e.message);
+            lastBindingError = e;
+            console.error('[binding] Binding.txt → ERROR:', e.message);
             if (attempt < BINDING_LOAD_ATTEMPTS) {
                 await sleep(2000 * Math.pow(2, attempt - 1));
             }
         }
     }
-    bindingState.ready = false;
-    bindingState.error = lastError ? lastError.message : 'unknown error';
-    throw lastError || new Error('Khong nap duoc binding data');
+    if (!bindingLoaded) {
+        bindingState.ready = false;
+        bindingState.error = lastBindingError ? lastBindingError.message : 'unknown error';
+        throw lastBindingError || new Error('Khong nap duoc Binding.txt tu OneDrive');
+    }
+
+    // 2. Load Hash4.txt (important for auth — log error but don't fail startup)
+    try {
+        const text = await new Promise((resolve, reject) => {
+            fetchOneDriveText(ONEDRIVE_HASH4_URL, REMOTE_MAX_BODY, (err, body) => {
+                if (err) reject(err); else resolve(body);
+            });
+        });
+        const data = JSON.parse(text);
+        if (!Array.isArray(data)) throw new Error('Hash4.txt khong phai JSON array');
+        const set = new Set(data.filter(
+            x => typeof x === 'string' && CRYPTO_HASH_RE.test(x)
+        ));
+        hash4Cache = { list: set, loadedAt: Date.now(), ok: true, error: null };
+        console.log('[hash4] Hash4.txt → OK — da nap ' + set.size + ' hash');
+    } catch (e) {
+        hash4Cache = { list: new Set(), loadedAt: 0, ok: false, error: e.message };
+        console.error('[hash4] Hash4.txt → ERROR:', e.message);
+    }
+
+    // 3. Load Member.txt (non-critical)
+    try {
+        const text = await new Promise((resolve, reject) => {
+            fetchOneDriveText(ONEDRIVE_MEMBER_URL, REMOTE_MAX_BODY, (err, body) => {
+                if (err) reject(err); else resolve(body);
+            });
+        });
+        const data = JSON.parse(text);
+        if (!Array.isArray(data)) throw new Error('Member.txt khong phai JSON array');
+        memberCache = { data, loadedAt: Date.now(), ok: true, error: null };
+        console.log('[member] Member.txt → OK — da nap ' + data.length + ' member');
+    } catch (e) {
+        memberCache = { data: null, loadedAt: 0, ok: false, error: e.message };
+        console.error('[member] Member.txt → ERROR:', e.message);
+    }
+
+    // 4. Load TargetUrl.txt (non-critical)
+    try {
+        const text = await new Promise((resolve, reject) => {
+            fetchOneDriveText(ONEDRIVE_TARGETURL_URL, REMOTE_MAX_BODY, (err, body) => {
+                if (err) reject(err); else resolve(body);
+            });
+        });
+        const data = JSON.parse(text);
+        targeturlCache = { data, loadedAt: Date.now(), ok: true, error: null };
+        console.log('[targeturl] TargetUrl.txt → OK');
+    } catch (e) {
+        targeturlCache = { data: null, loadedAt: 0, ok: false, error: e.message };
+        console.error('[targeturl] TargetUrl.txt → ERROR:', e.message);
+    }
 }
 
-// Xep hang cac thay doi de hai request khong ghi de len nhau trong cung process.
+// ---- Allowlist (from Hash4.txt OneDrive cache) ------------------------------
+// Callback receives { list: Set, ok: boolean } — same interface as before.
+function fetchAllowlist(cb) {
+    const now = Date.now();
+
+    // Static override (for testing / fallback)
+    if (ALLOWLIST_STATIC) {
+        try {
+            const set = new Set(JSON.parse(ALLOWLIST_STATIC).filter(
+                x => typeof x === 'string' && CRYPTO_HASH_RE.test(x)
+            ));
+            return cb({ list: set, ok: true });
+        } catch (e) {
+            return cb({ list: new Set(), ok: false });
+        }
+    }
+
+    // Use fresh cache if available
+    if (hash4Cache.ok && (now - hash4Cache.loadedAt < ONEDRIVE_TTL_MS)) {
+        return cb({ list: hash4Cache.list, ok: true });
+    }
+
+    // Refresh from OneDrive Hash4.txt
+    fetchOneDriveText(ONEDRIVE_HASH4_URL, REMOTE_MAX_BODY, (err, text) => {
+        if (!err) {
+            try {
+                const data = JSON.parse(text);
+                if (Array.isArray(data)) {
+                    const set = new Set(data.filter(
+                        x => typeof x === 'string' && CRYPTO_HASH_RE.test(x)
+                    ));
+                    hash4Cache = { list: set, loadedAt: now, ok: true, error: null };
+                    return cb({ list: set, ok: true });
+                }
+            } catch (e) { /* fall through to stale cache */ }
+        }
+        // If refresh failed but we have stale cache, use it briefly
+        if (hash4Cache.ok) {
+            console.error('[hash4] refresh that bai, dung cache cu');
+            return cb({ list: hash4Cache.list, ok: true });
+        }
+        if (err) console.error('[hash4] fetch loi:', err.message);
+        cb({ list: new Set(), ok: false });
+    });
+}
+
+// ---- mutateBindings (in-memory ONLY — OneDrive is READ ONLY) ---------------
+// Queue mutations so two requests don't overwrite each other in the same process.
 let mutationQueue = Promise.resolve();
 function mutateBindings(mutator) {
     const operation = mutationQueue.then(async () => {
@@ -269,12 +340,9 @@ function mutateBindings(mutator) {
         const before = cloneBindings(bindings);
         try {
             const result = mutator();
-            await saveBindingsToJsonBin();
-            try {
-                saveLocalData();
-            } catch (e) {
-                console.error('[binding] local backup that bai:', e.message);
-            }
+            // NOTE: OneDrive is READ ONLY — bindings are kept in-memory only.
+            // New bindings will be lost when the server restarts.
+            // To persist, admin must manually update Binding.txt on OneDrive.
             bindingState.error = null;
             return result;
         } catch (e) {
@@ -285,66 +353,6 @@ function mutateBindings(mutator) {
     });
     mutationQueue = operation.catch(() => {});
     return operation;
-}
-
-// ---- allowlist --------------------------------------------------------------
-let allowCache = { list: new Set(), at: 0, ok: false };
-function fetchAllowlist(cb) {
-    const now = Date.now();
-    if (ALLOWLIST_STATIC) {
-        try {
-            allowCache = { list: new Set(JSON.parse(ALLOWLIST_STATIC)), at: now, ok: true };
-        } catch (e) {
-            allowCache = { list: new Set(), at: now, ok: false };
-        }
-        return cb(allowCache);
-    }
-    if (allowCache.ok && now - allowCache.at < ALLOWLIST_TTL_MS) return cb(allowCache);
-    const u = ALLOWLIST_JSON_URL + (ALLOWLIST_JSON_URL.includes('?') ? '&' : '?') + 'ts=' + now;
-    httpsGet(u, (err, body) => {
-        if (!err) {
-            try {
-                const rec = JSON.parse(body).record;
-                if (Array.isArray(rec)) {
-                    const set = new Set(rec.filter(
-                        x => typeof x === 'string' && CRYPTO_HASH_RE.test(x)
-                    ));
-                    allowCache = { list: set, at: now, ok: true };
-                }
-            } catch (e) { /* giu cache cu */ }
-        }
-        cb(allowCache);
-    });
-}
-
-function httpsGet(url, cb) {
-    let done = false;
-    const finish = (e, body) => {
-        if (!done) {
-            done = true;
-            cb(e, body);
-        }
-    };
-    try {
-        const req = https.get(url, { headers: { 'User-Agent': 'jvhd-auth/2.0' } }, res => {
-            let body = '';
-            let size = 0;
-            res.on('data', chunk => {
-                size += chunk.length;
-                if (size <= MAX_BODY * 40) body += chunk;
-            });
-            res.on('end', () => finish(
-                res.statusCode >= 200 && res.statusCode < 300
-                    ? null
-                    : new Error('HTTP ' + res.statusCode),
-                body
-            ));
-        });
-        req.on('error', e => finish(e, ''));
-        req.setTimeout(8000, () => req.destroy(new Error('timeout')));
-    } catch (e) {
-        finish(e, '');
-    }
 }
 
 // ---- challenge / nonce ------------------------------------------------------
@@ -494,8 +502,8 @@ async function handleAdmin(req, res, body, url) {
             if (!removed) return send(res, 200, { ok: false, error: 'khong co binding' });
             return send(res, 200, { ok: true });
         } catch (e) {
-            console.error('[binding] unbind khong luu duoc:', e.message);
-            return send(res, 503, { ok: false, error: 'khong luu duoc JSONBin' });
+            console.error('[binding] unbind loi:', e.message);
+            return send(res, 503, { ok: false, error: 'loi binding store' });
         }
     }
 
@@ -512,6 +520,31 @@ async function handleAdmin(req, res, body, url) {
                 k: value.k,
                 at: value.at,
             })),
+            // OneDrive data source status (for admin visibility)
+            onedrive: {
+                member: {
+                    ok: memberCache.ok,
+                    loadedAt: memberCache.loadedAt ? new Date(memberCache.loadedAt).toISOString() : null,
+                    count: memberCache.data ? memberCache.data.length : 0,
+                    error: memberCache.error,
+                },
+                hash4: {
+                    ok: hash4Cache.ok,
+                    loadedAt: hash4Cache.loadedAt ? new Date(hash4Cache.loadedAt).toISOString() : null,
+                    count: hash4Cache.list.size,
+                    error: hash4Cache.error,
+                },
+                binding: {
+                    ok: bindingState.ready,
+                    loadedAt: bindingState.loadedAt,
+                    error: bindingState.error,
+                },
+                targeturl: {
+                    ok: targeturlCache.ok,
+                    loadedAt: targeturlCache.loadedAt ? new Date(targeturlCache.loadedAt).toISOString() : null,
+                    error: targeturlCache.error,
+                },
+            },
         });
     }
     return send(res, 404, { error: 'khong ro' });
@@ -581,9 +614,9 @@ async function startServer() {
         console.error('[startup] CANH BAO: ADMIN_TOKEN chua duoc cau hinh');
     }
     try {
-        await loadBindingsAtStartup();
+        await loadAllAtStartup();
     } catch (e) {
-        console.error('[startup] KHONG NAP DUOC BINDING DATA:', e.message);
+        console.error('[startup] KHONG NAP DUOC DATA TU ONEDRIVE:', e.message);
         console.error('[startup] dung server de dam bao fail-closed');
         process.exitCode = 1;
         return;
@@ -605,10 +638,9 @@ module.exports = {
         newNonce,
         bindingsRef: () => bindings,
         bindingStateRef: () => bindingState,
-        loadLocalData,
-        saveLocalData,
-        loadBindingsFromJsonBin,
-        saveBindingsToJsonBin,
+        memberCacheRef: () => memberCache,
+        hash4CacheRef: () => hash4Cache,
+        targeturlCacheRef: () => targeturlCache,
         normalizeBindings,
     },
 };
